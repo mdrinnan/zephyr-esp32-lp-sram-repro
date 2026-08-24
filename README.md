@@ -1,71 +1,29 @@
-# Zephyr + MCUboot: LP-SRAM sections are never loaded on Espressif targets
+# MCUboot never loads `.rtc.force_fast` / `.rtc.force_slow` on Espressif targets
 
-A reproducer for [zephyrproject-rtos/zephyr#117359](https://github.com/zephyrproject-rtos/zephyr/pull/117359).
-Related: [discussion #106900](https://github.com/zephyrproject-rtos/zephyr/discussions/106900), which
-reports the same symptom on ESP32-S3.
+Reproducer for **[zephyrproject-rtos/zephyr#117359](https://github.com/zephyrproject-rtos/zephyr/pull/117359)**.
+Same symptom reported on ESP32-S3 in [discussion #106900](https://github.com/zephyrproject-rtos/zephyr/discussions/106900).
 
-**The defect.** For MCUboot builds, `soc/espressif/<soc>/default.ld` emits an
-`esp_image_load_header_t` (`.metadata`) that the MCUboot Espressif port uses to copy the
-application into RAM. It has one descriptor for LP_IRAM and one for LP_DRAM, but there are
-**four** loadable LP-SRAM sections. `.rtc.force_fast` and `.rtc.force_slow` are described by
-neither, so MCUboot never copies them and they come up as whatever LP-SRAM last contained.
-The bytes are in the flashed image; nothing ever reads them.
+| | |
+|---|---|
+| **Defect** | The `.metadata` load table in `soc/espressif/<soc>/default.ld` carries two LP descriptors for **four** loadable LP-SRAM sections. `.rtc.force_fast` and `.rtc.force_slow` are described by neither. |
+| **Effect** | Those sections are in the flashed image but are never copied into RAM. Zero-initialised ESP-IDF statics come up as whatever LP-SRAM last held. |
+| **Affected** | 8 of the 9 Espressif SoCs on `main`: `esp32`, `esp32c3`, `esp32c5`, `esp32c6`, `esp32h2`, `esp32p4`, `esp32s2`, `esp32s3`. Only `esp32c2`, which has no LP sections, is clear. #117359 fixes five of the eight — see [Scope](#scope). |
+| **Not affected** | Direct boot. The ROM loader uses the esptool segment list, which is correct. That is why this presents as "MCUboot costs current". |
+| **Why it bites** | `s_sleep_sub_mode_ref_cnt[]` lands in `.rtc.force_slow`. Garbage counts make `esp_deep_sleep_start()` keep the LP peripheral domain powered — about 80 µA on our ESP32-C6. |
+| **To confirm** | One build, one script, **no hardware**. Five minutes. |
 
-A directly-booted image is unaffected — the ROM loader uses the esptool segment list, which
-is correct. Only the MCUboot path is affected, which is why this presents as "MCUboot costs
-current".
+## Confirm it in five minutes
 
-**Why it matters.** `.rtc.force_slow` holds `s_sleep_sub_mode_ref_cnt[]` from
-`esp_hw_support/sleep_modes.c`. Garbage counts make `esp_deep_sleep_start()` believe several
-sub-modes are active, so it keeps the LP peripheral domain powered. On our ESP32-C6 that was
-worth about 80 µA of deep-sleep current.
-
----
-
-## Two ways to reproduce
-
-| | needs | proves |
-|---|---|---|
-| **A. ELF check** | a toolchain, ~5 min | the load table does not describe the sections |
-| **B. On-device** | a board and a console | the data really does not arrive in RAM |
-
-Path A is the one to run first. It needs no hardware, it is deterministic, and it fails on
-every affected target.
-
-Reproducing the **current** figures additionally needs a power analyser — see
-[Measuring the current](#measuring-the-current). You do not need to, in order to confirm the
-defect.
-
-## Prerequisites
-
-A Zephyr workspace with the Espressif HAL and an installed Zephyr SDK. Any recent `main`
-works; the defect has been present for a long time.
+Needs a Zephyr workspace with the Espressif HAL, an installed SDK, and `readelf` on `PATH`.
+Any recent `main` works — the defect is long-standing.
 
 ```sh
 west init -m https://github.com/zephyrproject-rtos/zephyr zephyrproject
 cd zephyrproject && west update && west blobs fetch hal_espressif
+export ZEPHYR_BASE=$PWD/zephyr
 ```
 
-Then, from this repository's root, with `ZEPHYR_BASE` pointing at that workspace's `zephyr`.
-
----
-
-## A. The ELF check (no hardware)
-
-`lp_sram_repro` puts a known pattern into each of the three loadable LP data sections and
-also populates the two `NOLOAD` ones. `check_lp_descriptors.py` reads the built ELF's
-`.metadata` header and asserts, for every loadable LP section, that
-
-1. it is covered by exactly one descriptor, **and**
-2. its offset within that descriptor is the same in VMA as in LMA.
-
-The second assertion is the one that matters if you are reviewing a fix rather than
-confirming the bug: a descriptor that merely *spans* the sections is still wrong while the
-`NOLOAD` `.rtc.bss` / `.rtc_noinit` sit between the loadable ones, because then the VMA and
-LMA spans diverge and the loader writes to the wrong address. A coverage-only check passes
-that broken fix.
-
-### Before the fix
+Then from a clone of this repository:
 
 ```sh
 west build --sysbuild -b esp32c6_devkitc/esp32c6/hpcore -p always \
@@ -84,11 +42,12 @@ python3 check_lp_descriptors.py build-stock/lp_sram_repro/zephyr/zephyr.elf
     - .rtc.force_slow @0x50000034+0x10 covered by 0 descriptors
 ```
 
-`.rtc.data` **is** covered, exactly and correctly. That is the point: the load table works,
-it just describes the wrong sections. Note also that `.rtc.force_slow` sits at `+0x34`, not
-`+0x20` — the `NOLOAD` `.rtc.bss` and `.rtc_noinit` are in between.
+**That is the whole defect.** `.rtc.data` *is* covered, exactly and correctly — the load table
+works, it just describes the wrong sections. Note too that `.rtc.force_slow` sits at `+0x34`
+rather than `+0x20`: the `NOLOAD` `.rtc.bss` and `.rtc_noinit` are in between, which is why a
+descriptor fix alone is not sufficient (see below).
 
-### After the fix
+Now apply the fix and repeat:
 
 ```sh
 curl -L https://github.com/zephyrproject-rtos/zephyr/pull/117359.patch \
@@ -107,13 +66,36 @@ python3 check_lp_descriptors.py build-patched/lp_sram_repro/zephyr/zephyr.elf
   PASS  (3 LP sections fully covered)
 ```
 
-`.rtc.force_slow` has moved to `+0x20`, contiguous with `.rtc.data`, and the descriptor now
+`.rtc.force_slow` has moved to `+0x20`, contiguous with `.rtc.data`, and one descriptor now
 spans all three.
 
-### Other targets
+Everything below is detail.
 
-`lp_sram_repro` uses only section attributes — no SoC-specific linker symbols, no
-`esp_sleep` calls — so it builds unchanged everywhere. Swap the board:
+---
+
+## What the check asserts, and why the second assertion matters
+
+`lp_sram_repro` puts a known pattern into each of the three loadable LP data sections and also
+populates the two `NOLOAD` ones. `check_lp_descriptors.py` reads the built ELF's `.metadata`
+header and asserts, for every loadable LP section, that
+
+1. it is covered by exactly one descriptor, **and**
+2. its offset within that descriptor is the same in VMA as in LMA.
+
+If you are reviewing a fix rather than confirming the bug, the second assertion is the one to
+care about. A descriptor that merely *spans* the sections is still wrong while the `NOLOAD`
+`.rtc.bss` / `.rtc_noinit` sit between the loadable ones: the VMA and LMA spans then diverge
+and the loader writes to the wrong address, clobbering the `NOLOAD` sections. A coverage-only
+check passes that broken fix.
+
+`.rtc.data` doubles as a positive control. The unpatched table describes it correctly, so if it
+ever fails the problem is something else — nothing is loading LP-SRAM at all — and the
+on-device verdict says `INCONCLUSIVE` rather than blaming this defect.
+
+## Other targets
+
+`lp_sram_repro` uses only section attributes — no SoC-specific linker symbols, no `esp_sleep`
+calls — so it builds unchanged everywhere. Swap the board:
 
 ```
 esp32c3_devkitm    esp32c5_devkitc/esp32c5/hpcore    esp32c6_devkitc/esp32c6/hpcore
@@ -122,9 +104,12 @@ esp32h2_devkitm    esp32p4_function_ev_board/esp32p4/hpcore
 
 All five fail before the patch and pass after it.
 
+Reproducing the **current** figures additionally needs a power analyser — see
+[Measuring the current](#measuring-the-current). You do not need to, to confirm the defect.
+
 ---
 
-## B. On-device
+## On-device check
 
 Same application. Flash it and read the console.
 
@@ -132,7 +117,8 @@ Same application. Flash it and read the console.
 west flash -d build-stock
 ```
 
-It prints every word of the three loadable LP sections and a verdict:
+It prints every word of the three loadable LP sections and a verdict. Expected output on an
+unpatched MCUboot build, abridged:
 
 ```
 === LP-SRAM load check ===
@@ -147,10 +133,6 @@ mode: reporting whatever LP-SRAM contains at boot
 VERDICT: BUG -- 8 words of .rtc.force_fast/.rtc.force_slow were never loaded, while the
 .rtc.data control loaded correctly.
 ```
-
-`.rtc.data` is the built-in control. If it fails too, something else is wrong — nothing is
-loading LP-SRAM at all — and the verdict says `INCONCLUSIVE` rather than blaming this
-defect.
 
 Expected results:
 
