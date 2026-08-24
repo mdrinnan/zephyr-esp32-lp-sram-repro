@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+
+menu "LP-SRAM reproducer"
+
+config LP_REPRO_POISON
+	bool "Poison the LP sections and reboot before reporting"
+	select REBOOT
+	help
+	  Write a poison pattern over the three loadable LP data sections and reboot,
+	  then report on the following boot. Makes the result independent of whatever
+	  LP-SRAM happened to contain, at the cost of one extra reset.
+
+config LP_REPRO_STARTUP_DELAY_MS
+	int "Delay before printing, ms"
+	default 8000
+	help
+	  A native USB-CDC console has to re-enumerate after every reset before it can
+	  carry any output. Set to 0 on a UART console.
+
+endmenu
+
+source "Kconfig.zephyr"
