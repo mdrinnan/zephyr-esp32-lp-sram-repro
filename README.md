@@ -159,9 +159,14 @@ west build --sysbuild -b esp32c6_devkitc/esp32c6/hpcore -p always \
     -- -Dlp_sram_repro_EXTRA_CONF_FILE=poison.conf
 ```
 
-Under sysbuild, application Kconfig fragments must carry the image-name prefix
-(`lp_sram_repro_`). Without it the fragment is silently ignored and you get the
-non-deterministic build back. For a plain build it is just `-DEXTRA_CONF_FILE=poison.conf`.
+The `lp_sram_repro_` prefix names the sysbuild image the fragment applies to. Plain
+`-DEXTRA_CONF_FILE=poison.conf` also reaches the application image, but the prefixed form is
+unambiguous and is the only way to aim a fragment at a different image
+(`mcuboot_EXTRA_CONF_FILE=...`). For a non-sysbuild build it is just
+`-DEXTRA_CONF_FILE=poison.conf`.
+
+Either way, confirm it took before trusting the result:
+`grep CONFIG_LP_REPRO_POISON build-stock-poison/lp_sram_repro/zephyr/.config`.
 
 In poison mode an unpatched build reads back `a5a5a5a5` for the two uncovered sections —
 the exact bytes it wrote before rebooting — rather than arbitrary garbage.
@@ -201,15 +206,21 @@ readelf -lW build-stock/lp_sram_repro/zephyr/zephyr.elf | awk '/LOAD/ && /0x5000
 ```
 
 ```
-  LOAD  0x0002c4 0x50000000 0x00000080 0x00020 0x00030 RW  0x4   <-- .rtc.force_fast + .rtc.data
-  LOAD  0x000000 0x50000030 0x000000a0 0x00000 0x00004 RW  0x4   <-- NOLOAD, nothing to copy
+                offset   vaddr      paddr      filesz  memsz
+  LOAD  0x0002c4 0x50000000 0x00000080 0x00020 0x00030 RW  0x4   <-- .rtc.force_fast + .rtc.data,
+                                                                    memsz also spans .rtc.bss
+  LOAD  0x000000 0x50000030 0x000000a0 0x00000 0x00004 RW  0x4   <-- .rtc_noinit, NOLOAD
   LOAD  0x0002e4 0x50000034 0x000000a0 0x00010 0x00010 RW  0x4   <-- .rtc.force_slow
 ```
 
-`0x20 + 0x10 = 0x30` bytes of initialised LP data in the image, and the ROM loader copies
-all of it — a direct boot prints one `load:0x50000000,len:...` line per segment. The
-`.metadata` table MCUboot reads describes `0x10`, the middle one. The bytes are there; the
-table does not mention them.
+Two of the three segments are file-backed, holding `0x20 + 0x10 = 0x30` bytes of initialised
+LP data between them, and the ROM loader copies all of it — a direct boot logs the segments
+it copies as `load:<addr>,len:<n>` lines.
+
+The `.metadata` table MCUboot reads describes `0x10` of that: `.rtc.data`, which sits inside
+the first segment. `.rtc.force_fast` — the other half of that same segment — and
+`.rtc.force_slow` are never mentioned. The bytes are in the image; the table does not point
+at them.
 
 To see which symbols land in the affected region:
 
