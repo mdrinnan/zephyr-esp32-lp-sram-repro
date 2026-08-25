@@ -1,29 +1,20 @@
 # MCUboot never loads `.rtc.force_fast` / `.rtc.force_slow` on Espressif targets
 
-Reproducer for **[zephyrproject-rtos/zephyr#117359](https://github.com/zephyrproject-rtos/zephyr/pull/117359)**.
-Same symptom reported on ESP32-S3 in [discussion #106900](https://github.com/zephyrproject-rtos/zephyr/discussions/106900).
+Reproducer for **[zephyrproject-rtos/zephyr#117359](https://github.com/zephyrproject-rtos/zephyr/pull/117359)**
+· same symptom on ESP32-S3 in [#106900](https://github.com/zephyrproject-rtos/zephyr/discussions/106900)
+
+`soc/espressif/<soc>/default.ld` emits a `.metadata` load table with **two** LP descriptors
+for **four** loadable LP-SRAM sections. `.rtc.force_fast` and `.rtc.force_slow` are described
+by neither, so MCUboot never copies them and they come up as whatever LP-SRAM last held.
+Direct boot is unaffected — the ROM loader uses the esptool segment list, which is correct.
 
 | | |
 |---|---|
-| **Defect** | The `.metadata` load table in `soc/espressif/<soc>/default.ld` carries two LP descriptors for **four** loadable LP-SRAM sections. `.rtc.force_fast` and `.rtc.force_slow` are described by neither. |
-| **Effect** | Those sections are in the flashed image but are never copied into RAM. Zero-initialised ESP-IDF statics come up as whatever LP-SRAM last held. |
-| **Affected** | 8 of the 9 Espressif SoCs on `main`: `esp32`, `esp32c3`, `esp32c5`, `esp32c6`, `esp32h2`, `esp32p4`, `esp32s2`, `esp32s3`. Only `esp32c2`, which has no LP sections, is clear. #117359 fixes five of the eight — see [Scope](#scope). |
-| **Not affected** | Direct boot. The ROM loader uses the esptool segment list, which is correct. That is why this presents as "MCUboot costs current". |
-| **Why it bites** | `s_sleep_sub_mode_ref_cnt[]` lands in `.rtc.force_slow`. Garbage counts make `esp_deep_sleep_start()` keep the LP peripheral domain powered — about 80 µA on our ESP32-C6. |
-| **To confirm** | One build, one script, **no hardware**. Five minutes. |
+| **Affected** | 8 of 9 Espressif SoCs on `main` (all but `esp32c2`). #117359 fixes five — see [Scope](#scope) |
+| **Cost** | `s_sleep_sub_mode_ref_cnt[]` lands in `.rtc.force_slow`; garbage counts keep the LP peripheral domain powered through deep sleep — ~80 µA on an ESP32-C6 |
+| **To confirm** | one build, one script, **no hardware** |
 
-## Confirm it in five minutes
-
-Needs a Zephyr workspace with the Espressif HAL, an installed SDK, and `readelf` on `PATH`.
-Any recent `main` works — the defect is long-standing.
-
-```sh
-west init -m https://github.com/zephyrproject-rtos/zephyr zephyrproject
-cd zephyrproject && west update && west blobs fetch hal_espressif
-export ZEPHYR_BASE=$PWD/zephyr
-```
-
-Then from a clone of this repository:
+## Confirm it
 
 ```sh
 west build --sysbuild -b esp32c6_devkitc/esp32c6/hpcore -p always \
@@ -42,12 +33,12 @@ python3 check_lp_descriptors.py build-stock/lp_sram_repro/zephyr/zephyr.elf
     - .rtc.force_slow @0x50000034+0x10 covered by 0 descriptors
 ```
 
-**That is the whole defect.** `.rtc.data` *is* covered, exactly and correctly — the load table
-works, it just describes the wrong sections. Note too that `.rtc.force_slow` sits at `+0x34`
-rather than `+0x20`: the `NOLOAD` `.rtc.bss` and `.rtc_noinit` are in between, which is why a
-descriptor fix alone is not sufficient (see below).
+`.rtc.data` *is* covered, exactly and correctly — the load table works, it just describes the
+wrong sections. `.rtc.force_slow` sits at `+0x34` rather than `+0x20` because the `NOLOAD`
+`.rtc.bss` and `.rtc_noinit` are in between, which is why a descriptor fix alone is not
+enough.
 
-Now apply the fix and repeat:
+Apply the fix and repeat:
 
 ```sh
 curl -L https://github.com/zephyrproject-rtos/zephyr/pull/117359.patch \
@@ -58,7 +49,6 @@ python3 check_lp_descriptors.py build-patched/lp_sram_repro/zephyr/zephyr.elf
 ```
 
 ```
-  LP_IRAM  dst=0x50000000 lma=0x000080 size=0x0000
   LP_DRAM  dst=0x50000000 lma=0x000080 size=0x0030
   .rtc.force_fast    vma=0x50000000 size=0x0010
   .rtc.data          vma=0x50000010 size=0x0010
@@ -66,10 +56,25 @@ python3 check_lp_descriptors.py build-patched/lp_sram_repro/zephyr/zephyr.elf
   PASS  (3 LP sections fully covered)
 ```
 
-`.rtc.force_slow` has moved to `+0x20`, contiguous with `.rtc.data`, and one descriptor now
-spans all three.
+<details>
+<summary>Workspace setup, if you do not already have one</summary>
 
-Everything below is detail.
+Needs a Zephyr workspace with the Espressif HAL, an installed SDK, and `readelf` on `PATH`.
+Any recent `main` works — the defect is long-standing.
+
+```sh
+west init -m https://github.com/zephyrproject-rtos/zephyr zephyrproject
+cd zephyrproject && west update && west blobs fetch hal_espressif
+export ZEPHYR_BASE=$PWD/zephyr
+```
+
+Then run the commands above from a clone of this repository.
+
+</details>
+
+Everything below is detail: [what the check asserts](#what-the-check-asserts-and-why-the-second-assertion-matters),
+[other targets](#other-targets), [on-device](#on-device-check),
+[current measurements](#measuring-the-current), [scope](#scope).
 
 ---
 
