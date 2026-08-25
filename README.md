@@ -117,22 +117,35 @@ Same application. Flash it and read the console.
 west flash -d build-stock
 ```
 
-It prints every word of the three loadable LP sections and a verdict. Expected output on an
-unpatched MCUboot build, abridged:
+It prints every word of the three loadable LP sections and a verdict. Captured from a XIAO
+ESP32-C6, unpatched MCUboot build, built with `poison.conf`:
 
 ```
 === LP-SRAM load check ===
-boot flag at entry: ........
-mode: reporting whatever LP-SRAM contains at boot
+boot flag at entry: 5eeded01
+mode: poisoned with a5a5a5a5 and rebooted, so this is a cold-start load
 .rtc.force_fast  at 0x50000000, expect f0f0f0f0
-  [0] .......  <-- NOT LOADED
-  ...
+  [0] a5a5a5a5 <-- NOT LOADED
+  [1] a5a5a5a5 <-- NOT LOADED
+  [2] a5a5a5a5 <-- NOT LOADED
+  [3] a5a5a5a5 <-- NOT LOADED
 .rtc.data        at 0x50000010, expect dadadada
   [0] dadadada ok
-  ...
+  [1] dadadada ok
+  [2] dadadada ok
+  [3] dadadada ok
+.rtc.force_slow  at 0x50000034, expect 51005100
+  [0] a5a5a5a5 <-- NOT LOADED
+  [1] a5a5a5a5 <-- NOT LOADED
+  [2] a5a5a5a5 <-- NOT LOADED
+  [3] a5a5a5a5 <-- NOT LOADED
+
 VERDICT: BUG -- 8 words of .rtc.force_fast/.rtc.force_slow were never loaded, while the
 .rtc.data control loaded correctly.
 ```
+
+The same build with the patch applied reports every word `ok`, and `.rtc.force_slow` moves to
+`0x50000020` — the reorder, visible on the device.
 
 Expected results:
 
@@ -145,9 +158,13 @@ Expected results:
 ### Making the on-device result deterministic
 
 By default the application reports whatever LP-SRAM holds at boot, which is normally
-uninitialised garbage — but not guaranteed to be. **If the previous image left those words
-at zero, an unpatched build can report `OK`.** The realistic way to trip over this is to run
-the good build first and the bad build second without removing power in between.
+uninitialised garbage — but not guaranteed to be. **If a previous image left the correct
+values there, an unpatched build reports `OK`.**
+
+This is not hypothetical. Flashing the no-MCUboot build (which loads all three sections
+correctly) and then the unpatched MCUboot build, without removing power in between, produced
+a clean `VERDICT: OK` from the *broken* build: MCUboot never copied those sections, but the
+right values were already sitting in LP-SRAM from the previous run.
 
 Build with the `poison.conf` fragment to remove the doubt. The application then writes
 `a5a5a5a5` over the three sections, reboots, and reports on the next boot — so the values it
@@ -186,6 +203,22 @@ The application waits `CONFIG_LP_REPRO_STARTUP_DELAY_MS` (default 8000) before p
 because a native USB-CDC console has to re-enumerate after every reset before it can carry
 output. On a UART console set it to 0.
 
+**If the console stays silent, check the boot mode before suspecting the firmware.** On a
+target whose console is the built-in USB-Serial-JTAG, DTR and RTS drive `EN` and the `GPIO9`
+boot strap — so merely opening the port can reset the chip into ROM download mode, where it
+enumerates normally, opens without error, and says nothing. That is indistinguishable from
+"the application printed nothing" unless you look:
+
+```
+rst:0x15 (USB_UART_HPSYS),boot:0x77 (DOWNLOAD(USB/UART0/SDIO_REI_REO))
+waiting for download
+```
+
+A normal boot shows `boot:0x7f (SPI_FAST_FLASH_BOOT)` instead. `esptool --before no-reset
+--after no-reset flash-id` is a quick confirmation: it performs no reset, so it succeeds only
+if the chip is already parked in ROM. Clear DTR and RTS immediately after opening the port,
+and check nothing is holding the BOOT button down.
+
 ### One thing that is *not* a bug
 
 MCUboot loads the LP_DRAM descriptor only when the reset reason is **not** deep-sleep wake,
@@ -214,8 +247,19 @@ readelf -lW build-stock/lp_sram_repro/zephyr/zephyr.elf | awk '/LOAD/ && /0x5000
 ```
 
 Two of the three segments are file-backed, holding `0x20 + 0x10 = 0x30` bytes of initialised
-LP data between them, and the ROM loader copies all of it — a direct boot logs the segments
-it copies as `load:<addr>,len:<n>` lines.
+LP data between them, and the ROM loader copies all of it. From a direct boot on hardware:
+
+```
+rst:0x15 (USB_UART_HPSYS),boot:0x7f (SPI_FAST_FLASH_BOOT)
+...
+load:0x50000000,len:0x20
+load:0x50000034,len:0x10
+...
+I (boot): RTC_IRAM : lma=0000a814h vma=50000000h size=00020h (    32)
+I (boot): RTC_IRAM : lma=0000a83ch vma=50000034h size=00010h (    16)
+```
+
+Those are the same two spans the program headers list, at the same addresses.
 
 The `.metadata` table MCUboot reads describes `0x10` of that: `.rtc.data`, which sits inside
 the first segment. `.rtc.force_fast` — the other half of that same segment — and
@@ -309,6 +353,15 @@ the `_reserved[4]` words of `esp_image_load_header_t` but is a coordinated MCUbo
 
 Ten sysbuilds — five targets, before and after — with no build errors in either phase:
 5/5 `FAIL` before the patch, 5/5 `PASS` after.
+
+On hardware, a XIAO ESP32-C6 with `poison.conf`, same board and same application throughout,
+differing only by the linker patch:
+
+| build | verdict |
+|---|---|
+| unpatched + MCUboot | `BUG` — both uncovered sections read back as the poison pattern |
+| patched + MCUboot | `OK` — all three sections loaded, `.rtc.force_slow` at `0x50000020` |
+| no MCUboot | `OK` |
 
 ## Licence
 
